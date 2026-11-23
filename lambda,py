@@ -1,0 +1,113 @@
+"""
+Lambda: lee CSV de un bucket/carpeta y sube un JSON por fila a otro bucket/subcarpeta.
+
+Variables de entorno:
+  SOURCE_BUCKET   Bucket origen (solo para invocación manual)
+  SOURCE_PREFIX   Carpeta origen, ej: "entrada/csv/"
+  DEST_BUCKET     Bucket destino
+  DEST_PREFIX     Subcarpeta destino, ej: "salida/json/"
+  ID_COLUMN       (opcional) Columna para nombrar cada JSON; si no, usa el número de fila
+  CSV_DELIMITER   (opcional) Separador, por defecto ","
+  MAX_WORKERS     (opcional) Subidas en paralelo, por defecto 16
+
+Formas de uso:
+  - Trigger S3 (ObjectCreated en SOURCE_PREFIX con sufijo .csv): procesa el archivo subido.
+  - Invocación manual / EventBridge: procesa todos los .csv de SOURCE_BUCKET/SOURCE_PREFIX.
+    También acepta {"bucket": "...", "key": "..."} para procesar uno solo.
+"""
+import csv
+import codecs
+import json
+import os
+import re
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+import boto3
+
+s3 = boto3.client("s3")
+
+SOURCE_BUCKET = os.environ.get("SOURCE_BUCKET", "").strip()
+SOURCE_PREFIX = os.environ.get("SOURCE_PREFIX", "").strip()
+DEST_BUCKET = os.environ["DEST_BUCKET"].strip()
+DEST_PREFIX = os.environ.get("DEST_PREFIX", "").strip().strip("/")
+ID_COLUMN = os.environ.get("ID_COLUMN", "").strip()
+CSV_DELIMITER = os.environ.get("CSV_DELIMITER", ",")
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
+
+
+def safe_name(value: str) -> str:
+    """Limpia un valor para usarlo como nombre de archivo en S3."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value).strip()) or "sin_id"
+
+
+def put_json(key: str, data: dict) -> None:
+    s3.put_object(
+        Bucket=DEST_BUCKET,
+        Key=key,
+        Body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def process_csv(bucket: str, key: str) -> int:
+    print(f"Procesando s3://{bucket}/{key}")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+
+    # Lectura en streaming (no carga todo el archivo en memoria). utf-8-sig quita el BOM de Excel.
+    reader = csv.DictReader(
+        codecs.getreader("utf-8-sig")(obj["Body"]), delimiter=CSV_DELIMITER
+    )
+
+    base = os.path.splitext(os.path.basename(key))[0]
+    dest_dir = f"{DEST_PREFIX}/{base}" if DEST_PREFIX else base
+
+    count = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = []
+        for i, row in enumerate(reader, start=1):
+            # Limpia espacios en encabezados y valores; descarta columnas sin nombre
+            record = {
+                (k or "").strip(): (v.strip() if isinstance(v, str) else v)
+                for k, v in row.items()
+                if k
+            }
+            if not any(record.values()):
+                continue  # fila vacía
+
+            name = safe_name(record.get(ID_COLUMN, "")) if ID_COLUMN else f"fila_{i:06d}"
+            futures.append(pool.submit(put_json, f"{dest_dir}/{name}.json", record))
+            count += 1
+
+        for f in futures:
+            f.result()  # propaga cualquier error de subida
+
+    print(f"{count} JSON subidos a s3://{DEST_BUCKET}/{dest_dir}/")
+    return count
+
+
+def list_csvs(bucket: str, prefix: str):
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for item in page.get("Contents", []):
+            if item["Key"].lower().endswith(".csv"):
+                yield item["Key"]
+
+
+def lambda_handler(event, context):
+    results = {}
+
+    if event.get("Records"):  # Trigger de S3
+        for rec in event["Records"]:
+            bucket = rec["s3"]["bucket"]["name"]
+            key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])
+            if key.lower().endswith(".csv"):
+                results[key] = process_csv(bucket, key)
+    elif event.get("key"):  # Un archivo puntual
+        bucket = event.get("bucket", SOURCE_BUCKET)
+        results[event["key"]] = process_csv(bucket, event["key"])
+    else:  # Toda la carpeta
+        for key in list_csvs(SOURCE_BUCKET, SOURCE_PREFIX):
+            results[key] = process_csv(SOURCE_BUCKET, key)
+
+    return {"statusCode": 200, "procesados": results}
